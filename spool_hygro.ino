@@ -2,7 +2,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <SparkFunLSM6DS3.h>
+#include <BMI160Gen.h>
 #include <Wire.h>
 #include <driver/rtc_io.h>
 #include <soc/rtc_cntl_reg.h>
@@ -15,7 +15,7 @@
 #define SDA GPIO_NUM_12
 #define SCL GPIO_NUM_13
 #define BME_I2C_ADDR 0x76
-#define IMU_I2C_ADDR 0x6B
+#define IMU_I2C_ADDR 0x69
 #define SCREEN_ADDR 0x3C
 
 #define IMU_INTERRUPT_PIN GPIO_NUM_6
@@ -28,15 +28,19 @@
 #define TIME_TO_SLEEP  3600          
 
 
-LSM6DS3Core imu(I2C_MODE, IMU_I2C_ADDR);
 Adafruit_BME280 bme;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WiFiMulti WiFiMulti;
 NetworkClient netClient;
 PubSubClient client(netClient);
 esp_sleep_wakeup_cause_t wakeup_reason;
-float t, rH, Vbat;
+float t, rH, Vbat, p;
 
+
+void bmi160_intr(void)
+{
+  Serial.println("BMI160 interrupt: TAP!");
+}
 
 void show_display() {
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
@@ -86,8 +90,16 @@ void setup() {
     Serial.println("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
   }
 
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                    Adafruit_BME280::SAMPLING_X1, // temperature
+                    Adafruit_BME280::SAMPLING_X1, // pressure
+                    Adafruit_BME280::SAMPLING_X1, // humidity
+                    Adafruit_BME280::FILTER_OFF   );
+  bme.takeForcedMeasurement();
+
   t = bme.readTemperature();
   rH = bme.readHumidity();
+  p = bme.readPressure() / 100.0;
   analogReadResolution(12);
   Vbat = analogReadMilliVolts(GPIO_NUM_3) * 0.0022;
 
@@ -98,6 +110,10 @@ void setup() {
   Serial.print("Humidity = ");
   Serial.print(rH);
   Serial.println(" %");
+
+  Serial.print("Pressure = ");
+  Serial.print(p);
+  Serial.println(" hPa");
 
   Serial.print("Vbat = ");
   Serial.print(Vbat);
@@ -113,7 +129,7 @@ void setup() {
 
   setupIMU();
 
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+  if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
     show_display();
   }
 
@@ -121,9 +137,9 @@ void setup() {
   Serial.println();
   Serial.print("Waiting for WiFi... ");
 
-  while (WiFiMulti.run() != WL_CONNECTED) {
+  for (int i=0; WiFiMulti.run() != WL_CONNECTED && i < 20; i++) {
     Serial.print(".");
-    delay(500);
+    delay(1000);
   }
 
   Serial.println("");
@@ -135,7 +151,7 @@ void setup() {
   Serial.print("Attempting MQTT connection...");
   if (client.connect(HYGRO_ID)) {
     Serial.println("connected");
-    String msg = String("[{\"id\": \"") + String(HYGRO_ID) + "\", \"t\": " + String(t) + ", \"rH\": " + String(rH) + ", \"Vbat\": " + String(Vbat) + "}]";
+    String msg = String("{\"id\": \"") + String(HYGRO_ID) + "\", \"t\": " + String(t) + ", \"rH\": " + String(rH) + ", \"p\": " + String(p)  + ", \"Vbat\": " + String(Vbat) + "}";
     Serial.println("attempting to publish");
     if (client.publish(MQTT_TOPIC, msg.c_str())) {
       Serial.print("message sent: ");
@@ -161,51 +177,10 @@ void setup() {
 
 void setupIMU() {
 
-  if (imu.beginCore() != 0) {
-    Serial.println("imu160: Error");
-  } else {
-    Serial.println("imu160: OK");
-  }
-
-  uint8_t errorAccumulator = 0;
-  uint8_t dataToWrite = 0;
-
-  //Setup the accelerometer******************************
-  dataToWrite = 0;  //Start Fresh!
-  dataToWrite |= LSM6DS3_ACC_GYRO_BW_XL_200Hz;
-  dataToWrite |= LSM6DS3_ACC_GYRO_FS_XL_2g;
-  dataToWrite |= LSM6DS3_ACC_GYRO_ODR_XL_416Hz;
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_CTRL1_XL, dataToWrite);
-
-  //Set the ODR bit
-  errorAccumulator += imu.readRegister(&dataToWrite, LSM6DS3_ACC_GYRO_CTRL4_C);
-  dataToWrite &= ~((uint8_t)LSM6DS3_ACC_GYRO_BW_SCAL_ODR_ENABLED);
-
-  // Enable tap detection on X, Y, Z axis, but do not latch output
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x0E);
-
-  // Set tap threshold
-  // Write 0Ch into TAP_THS_6D
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_TAP_THS_6D, 0x03);
-
-  // Set Duration, Quiet and Shock time windows
-  // Write 7Fh into INT_DUR2
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_INT_DUR2, 0x7F);
-
-  // Single & Double tap enabled (SINGLE_DOUBLE_TAP = 1)
-  // Write 80h into WAKE_UP_THS
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_WAKE_UP_THS, 0x80);
-
-  // Single tap interrupt driven to INT1 pin -- enable latch
-  // Write 08h into MD1_CFG
-  errorAccumulator += imu.writeRegister(LSM6DS3_ACC_GYRO_MD1_CFG, 0x48);
-
-  if (errorAccumulator) {
-    Serial.println("Problem configuring the device.");
-  } else {
-    Serial.println("Device O.K.");
-  }
-  esp_sleep_enable_ext0_wakeup(IMU_INTERRUPT_PIN, HIGH);
+  BMI160.begin(BMI160GenClass::I2C_MODE, Wire, IMU_I2C_ADDR, IMU_INTERRUPT_PIN);
+  BMI160.attachInterrupt(bmi160_intr);
+  BMI160.setIntTapEnabled(true);
+  esp_sleep_enable_ext0_wakeup(IMU_INTERRUPT_PIN, LOW);
 }
 
 
